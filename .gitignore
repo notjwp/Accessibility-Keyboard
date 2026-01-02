@@ -1,0 +1,40 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs and local state
+*.log
+*.tmp
+*.swp
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE configuration
+.vscode/
+.idea/
+
+# Media / generated assets
+*.mp4
+*.avi
+*.mov
+*.png
+*.jpg
+*.jpeg
+
+# Notebook checkpoints
+.ipynb_checkpoints/
