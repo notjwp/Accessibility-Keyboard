@@ -1,8 +1,6 @@
 print('[DEBUG] main.py started')
-
 import os
 import warnings
-
 # Suppress warnings from MediaPipe and TensorFlow (must be set before imports)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
 os.environ['GLOG_minloglevel'] = '2'  # Suppress MediaPipe C++ logging
@@ -322,6 +320,7 @@ def is_double_click(landmark_list, thumb_index_dist):
 # ==================== Voice Assistant Functions ====================
 engine = None
 recognizer = None
+TTS_LOCK = threading.Lock()
 
 def init_voice_assistant():
     global engine, recognizer
@@ -334,9 +333,10 @@ def init_voice_assistant():
         recognizer.dynamic_energy_threshold = True
         recognizer.dynamic_energy_adjustment_damping = 0.12
         recognizer.dynamic_energy_ratio = 1.6
-        recognizer.pause_threshold = 0.6  # Time of silence to consider end of phrase
-        recognizer.phrase_threshold = 0.35  # Min time of speaking audio before considering phrase
-        recognizer.non_speaking_duration = 0.3  # Duration of silence to mark end
+        # Keep listening through natural short pauses so full sentences are captured
+        recognizer.pause_threshold = 1.0  # seconds of silence before we stop listening
+        recognizer.phrase_threshold = 0.5  # minimum speech length to start a phrase
+        recognizer.non_speaking_duration = 0.5  # trailing silence considered part of the phrase
         return True
     except Exception as e:
         print(f"Voice assistant initialization failed: {e}")
@@ -391,29 +391,40 @@ def fuzzy_match_wake_word(text: str) -> bool:
             return True
     return False
 
-def speak(text: str, block: bool = False):
-    if engine:
-        print(f"Assistant: {text}")
-        engine.say(text)
-        if block:
-            engine.runAndWait()
-        else:
-            threading.Thread(target=engine.runAndWait, daemon=True).start()
-
-def speak_long(text: str):
-    """Speak long responses in manageable chunks (sentence by sentence)."""
+def _speak_blocking(text: str):
+    """Serialize TTS to avoid pyttsx3 'run loop already started' errors."""
     if not engine or not text:
         return
-    # Split on sentence boundaries conservatively while keeping the console output natural.
+    with TTS_LOCK:
+        engine.say(text)
+        engine.runAndWait()
+
+
+def speak(text: str, block: bool = False):
+    if not engine or not text:
+        return
+    print(f"Assistant: {text}")
+    if block:
+        _speak_blocking(text)
+    else:
+        threading.Thread(target=_speak_blocking, args=(text,), daemon=True).start()
+
+
+def speak_long(text: str):
+    """Speak long responses sentence-by-sentence, serialized to avoid run loop conflicts."""
+    if not engine or not text:
+        return
     import re as _re
     sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', text) if s.strip()]
     consolidated = " ".join(sentences)
     if consolidated:
         print(f"Assistant: {consolidated}")
-    for sent in sentences:
-        engine.say(sent)
-    # Run once for all queued sentences (blocking in a short async thread)
-    threading.Thread(target=engine.runAndWait, daemon=True).start()
+
+    def _run():
+        for sent in sentences:
+            _speak_blocking(sent)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 def recognize_once(timeout: Optional[int] = None, phrase_time_limit: Optional[int] = None) -> str:
     if not recognizer:
@@ -573,11 +584,12 @@ def wait_for_wake() -> bool:
         return False
 
 def ask_ollama(prompt: str) -> str:
+    """Call Ollama with a short timeout; return a clear fallback if unreachable."""
     try:
         with requests.post(
             OLLAMA_URL,
             json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True},
-            timeout=60,
+            timeout=10,  
             stream=True,
         ) as resp:
             resp.raise_for_status()
@@ -595,9 +607,9 @@ def ask_ollama(prompt: str) -> str:
                     continue
             return "".join(out).strip() or "No response."
     except requests.exceptions.ConnectionError:
-        return "Ollama is not running."
+        return "Ollama is not running or unreachable. Start Ollama and retry."
     except Exception as e:
-        return f"Error: {e}"
+        return f"LLM error: {e}"
 
 def execute_voice_command(command: str):
     global voice_assistant_enabled, assistant_running
@@ -692,7 +704,7 @@ def execute_voice_command(command: str):
         text_to_type = raw_command[type_prefix.end():].strip()
         if not text_to_type:
             speak("What should I type?")
-            follow_up = recognize_once(timeout=6, phrase_time_limit=10)
+            follow_up = recognize_once(timeout=8, phrase_time_limit=20)
             text_to_type = (follow_up or "").strip()
         if text_to_type:
             speak("Typing")
@@ -757,7 +769,7 @@ def voice_assistant_thread():
             now = time.time()
 
             if last_wake_time and (now - last_wake_time) <= FOLLOWUP_WINDOW_SECONDS:
-                cmd = recognize_once(timeout=6, phrase_time_limit=12)
+                cmd = recognize_once(timeout=8, phrase_time_limit=20)
                 if cmd:
                     execute_voice_command(cmd)
                     last_wake_time = time.time()
@@ -768,7 +780,7 @@ def voice_assistant_thread():
             if wait_for_wake():
                 last_wake_time = time.time()
                 speak("Yes?")
-                cmd = recognize_once(timeout=8, phrase_time_limit=18)
+                cmd = recognize_once(timeout=10, phrase_time_limit=25)
                 if cmd:
                     execute_voice_command(cmd)
                     last_wake_time = time.time()
